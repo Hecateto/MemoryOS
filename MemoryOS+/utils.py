@@ -18,6 +18,106 @@ from openai import OpenAI
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
+# 归一化与关键词相似度计算函数
+def normalize_score_batch(scores: List[float], method: str = 'minmax') -> List[float]:
+    """
+    批量归一化分数到 [0, 1] 区间
+
+    Args:
+        scores: 原始分数列表
+        method: 'minmax' | 'zscore' | 'rank'
+
+    Returns:
+        归一化后的分数列表
+    """
+    if not scores:
+        return []
+
+    if method == 'minmax':
+        min_s, max_s = min(scores), max(scores)
+        if max_s - min_s == 0:
+            return [0.5] * len(scores)
+        return [(s - min_s) / (max_s - min_s) for s in scores]
+    elif method == 'zscore':
+        import numpy as np
+        arr = np.array(scores)
+        mean, std = arr.mean(), arr.std()
+        if std == 0:
+            return [0.5] * len(scores)
+        z_scores = (arr - mean) / std
+        z_min, z_max = z_scores.min(), z_scores.max()
+        if z_max - z_min == 0:
+            return [0.5] * len(scores)
+        return [(z - z_min) / (z_max - z_min) for z in z_scores]
+    elif method == 'rank':
+        sorted_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+        normalized = [0.0] * len(scores)
+        for rank, idx in enumerate(sorted_indices):
+            normalized[idx] = 1.0 - (rank / len(scores))
+        return normalized
+
+    return scores
+
+
+def compute_keyword_similarity_jaccard(
+        new_keywords: List[str], existing_keywords: List[str],
+        synonym_dict: Optional[Dict[str, List[str]]] = None,
+        use_substring: bool = True
+) -> float:
+    """
+    改进的关键词相似度计算：加权 Jaccard + 同义词扩展 + 子串匹配
+
+    Args:
+        new_keywords: 新查询关键词列表
+        existing_keywords: 历史会话关键词列表
+        synonym_dict: 同义词词典 {word: [synonyms]}
+        use_substring: 是否启用子串匹配兜底
+
+    Returns:
+        相似度分数 ∈ [0, 1]
+    """
+    if not new_keywords or not existing_keywords:
+        return 0.0
+
+    matched_new = set()
+
+    for nk in new_keywords:
+        nk_lower = nk.lower()
+        synonyms = synonym_dict.get(nk_lower, []) if synonym_dict else []
+        for ek in existing_keywords:
+            ek_lower = ek.lower()
+            if (nk_lower == ek_lower or ek_lower in synonyms or nk_lower in synonyms or
+            (use_substring and (nk_lower in ek_lower or ek_lower in nk_lower))):
+                matched_new.add(nk)
+                break
+
+    intersection = len(matched_new)
+    union = len(set(new_keywords) | set(existing_keywords))
+    if union == 0.0:
+        return 0.0
+
+    return intersection / (union + 1e-7)
+
+
+def reciprocal_rank_fusion(results_list: List[List[Tuple[str, float]]], k: int = 60) -> Dict[str, float]:
+    """
+    RRF 融合：不依赖分数值，只依赖排名
+
+    Args:
+        results_list: 每个元素是 [(sid, score), ...] 的排序列表（按分数降序）
+        k: 平滑参数，通常取 60
+
+    Returns:
+        {sid: rrf_score}
+    """
+    from collections import defaultdict
+    rrf_scores = defaultdict(float)
+    for results in results_list:
+        for rank, (sid, _) in enumerate(results):
+            rrf_scores[sid] += 1.0 / (k + rank + 1)
+    return dict(rrf_scores)
+
+
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)

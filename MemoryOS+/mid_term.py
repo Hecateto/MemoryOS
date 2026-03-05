@@ -8,11 +8,13 @@ from typing import List, Dict, Any, Optional, Tuple
 
 try:
     from .utils import (
+        normalize_score_batch, compute_keyword_similarity_jaccard, reciprocal_rank_fusion,
         get_timestamp, generate_id, get_embedding, normalize_vector,
         compute_time_decay, ensure_directory_exists, OpenAIClient
     )
 except ImportError:
     from utils import (
+        normalize_score_batch, compute_keyword_similarity_jaccard, reciprocal_rank_fusion,
         get_timestamp, generate_id, get_embedding, normalize_vector,
         compute_time_decay, ensure_directory_exists, OpenAIClient
     )
@@ -157,7 +159,14 @@ class MidTermMemory:
         """
         if not self.access_frequency or not self.sessions:
             return
-        
+
+        invalid_sids = [sid for sid in self.access_frequency if sid not in self.sessions]
+        for sid in invalid_sids:
+            del self.access_frequency[sid]
+        if not self.access_frequency:
+            self.rebuild_heap()
+            return
+
         lfu_sid = min(self.access_frequency, key=self.access_frequency.get)
         logger.info(f"MTM: Evicting session {lfu_sid} with access count {self.access_frequency[lfu_sid]}")
 
@@ -295,7 +304,9 @@ class MidTermMemory:
                                  keywords_for_new_pages: List[str],
                                  pages_to_insert: List[Dict[str, Any]],
                                  similarity_threshold: float = 0.5,
-                                 keyword_similarity_alpha: float = 1.0) -> str:
+                                 keyword_similarity_alpha: float = 1.0,
+                                 use_rrf: bool = False,
+                                 synonym_dict: Optional[Dict[str, List[str]]] = None) -> str:
         """
         将新页面插入到最匹配的会话中，若无合适会话则新建会话
         
@@ -322,46 +333,67 @@ class MidTermMemory:
         )
         new_summary_vec = normalize_vector(new_summary_vec)
 
-        # 寻找最佳匹配的会话
-        best_sid = None
-        best_overall_score = -float('inf')
-        
+        candidates = [] # [(sid, semantic_sim, keyword_sim, overall_score)]
+
         for sid, session in self.sessions.items():
             # 摘要的语义相似度
             summary_vec = np.array(session['summary_embedding'], dtype=np.float32)
             semantic_sim = float(np.dot(summary_vec, new_summary_vec))
             
-            # 关键词的Jaccard相似度
-            # existing_keywords = set(session.get('summary_keywords', []))
-            # new_keywords = set(keywords_for_new_pages)
-            # s_topic_keywords = 0
-            # if existing_keywords and new_keywords:
-            #     intersection = len(existing_keywords.intersection(new_keywords))
-            #     union = len(existing_keywords.union(new_keywords))
-            #     if union > 0:
-            #         s_topic_keywords = intersection / union
 
-            # 关键词的包含匹配（Substring Matching）相似度
-            existing_keywords_list = set(session.get('summary_keywords', []))
-            new_keywords_list = set(keywords_for_new_pages)
-            s_topic_keywords = 0
+            # 关键词相似度
+            existing_keywords = session.get('summary_keywords', [])
+            keyword_sim = compute_keyword_similarity_jaccard(
+                new_keywords=keywords_for_new_pages,
+                existing_keywords=existing_keywords,
+                synonym_dict=synonym_dict,
+                use_substring=True
+            )
+            candidates.append((sid, semantic_sim, keyword_sim))
 
-            if existing_keywords_list and new_keywords_list:
-                for nk in new_keywords_list:
-                    for ek in existing_keywords_list:
-                        # 互为子串
-                        if nk.lower() in ek.lower() or ek.lower() in nk.lower():
-                            s_topic_keywords += 0.4
-                            break
-            
-            # 综合相似度得分 = 语义相似度 + α * 关键词相似度
-            overall_score = semantic_sim + keyword_similarity_alpha * s_topic_keywords
-            logger.info(f"MTM: Session {sid} - Semantic Sim: {semantic_sim:.4f}, Keyword Sim: {s_topic_keywords:.4f}, Overall Score: {overall_score:.4f}")
+        if use_rrf:
+            semantic_ranked = sorted(candidates, key=lambda x: x[1], reverse=True)
+            keyword_ranked = sorted(candidates, key=lambda x: x[2], reverse=True)
+            rrf_scores = reciprocal_rank_fusion(
+                [semantic_ranked, keyword_ranked],
+                k=60
+            )
+            scored_candidates = [(sid, rrf_scores.get(sid, 0.0)) for sid, _, _ in candidates]
+        else:
+            semantic_scores = [c[1] for c in candidates]
+            keyword_scores = [c[2] for c in candidates]
+
+            norm_semantic = normalize_score_batch(semantic_scores)
+            norm_keyword = normalize_score_batch(keyword_scores)
+
+            # 动态权重：根据查询关键词数量自适应
+            if len(keywords_for_new_pages) <= 2:
+                # 短查询/抽象查询：重语义
+                alpha = 0.3
+            else:
+                # 长查询/含实体：重关键词
+                alpha = min(0.7, keyword_similarity_alpha)  # 限制上限避免过度偏斜
+
+            scored_candidates = [
+                (candidates[i][0], (1 - alpha) * norm_semantic[i] + alpha * norm_keyword[i])
+                for i in range(len(candidates))
+            ]
+
+        scored_candidates.sort(key=lambda x: x[1], reverse=True)
+        top_k_candidates = scored_candidates[:5]
+
+        best_sid = None
+        best_overall_score = -float('inf')
+
+        for sid, overall_score in top_k_candidates:
+            if overall_score < 0.3:
+                continue
             if overall_score > best_overall_score:
                 best_overall_score = overall_score
                 best_sid = sid
 
         logger.info(f"MTM: Best matching session {best_sid} with score {best_overall_score:.4f}")
+
         # 合并到最佳匹配的会话
         if best_sid and best_overall_score >= similarity_threshold:
             logger.info(f"MTM: Inserting pages into existing session {best_sid} with score {best_overall_score:.4f}")
@@ -416,13 +448,10 @@ class MidTermMemory:
             target_session['summary_keywords'] = list(merged_keywords)
 
             """
-            - Threshold
-                - 这里给予了keywords重复极大的权重
-                - 也可以考虑降低semantic_threshold
             - Update
                 - 这里仅采用了更新keywords
                 - 也可以考虑更新summary和对应emb, 但会频繁调用emb_model
-                - 解决办法是记录session更新次数, 超过阈值触发summary重写 (控制在一定字数内)
+                - 可以记录session更新次数, 超过阈值触发summary重写 (控制字数)
             """
 
             # 重建堆并保存
